@@ -1,740 +1,820 @@
-# Project Instructions — Synthetic Data Pipeline for Agricultural VLA Robotics
+# 🎯 Project Goal
 
-> **For anyone picking this up cold.** This document is self-contained — everything needed to
-> build the project is here. **Read §0 before writing any domain prose.** Several
-> plausible-sounding claims about agricultural robotics standards are factually wrong and have
-> already been caught once; §0 records the corrections and exists to stop them coming back.
+Build a production-grade synthetic data pipeline that generates, validates, and analyzes field-task / robot-capability pairs using LLMs. Your system will act as an intelligent agricultural robotics procurement analyst that can identify capability mismatches, detect overclaiming, and provide actionable feedback.
 
----
+**Core Challenge**: Create a system that not only generates realistic data but also understands what makes a robot capability dossier "good" or "bad" for a specific field task, then prove it works through rigorous evaluation.
 
-## 0. Guardrails — read before writing any domain prose
-
-These are not style preferences. Each one is a specific factual error that an adversarial review
-caught in an earlier draft, verified against primary sources.
-
-| ❌ Do not | ✅ Instead |
-| --- | --- |
-| Cite ISO 18497 as defining autonomy *levels* | ISO 18497-1 defines a **non-ordinal vocabulary**. Clause 3 states, of each term: *"Partially automated is not a level or a category of a machine."* ISO 18497-4's Introduction records that SAE J3016's six levels were *"deliberately not chosen as a basis for the ISO 18497 series."* |
-| Claim any standard backs the 5-level autonomy ladder | **The ladder in §5 is a project invention.** Label it as such every time it appears. There is no ISO 18497-5, no ASABE autonomy-levels standard, and ISO 17757 is binary. Industry (VDMA/AEF) harmonizes on **Agri-ODD**, a scenario framework — not a ladder. |
-| Cite a standard for `field_readiness_grade` | ISO 18497-4 contains zero occurrences of *validation body*, *certif\**, *grade*, or *readiness*. The field exists **solely** to preserve a bounded-float validator. Defend it on that basis. |
-| Call failure mode #5 "overclaiming" | "Overclaiming" is not a term of art — zero arXiv full-text hits. The documented phenomenon is an **evaluation-validity gap**: LIBERO scores cluster at 90–95% while real-world performance spans the full range. Describe the gap; do not impute intent. |
-| List `RT-2-X` as a usable `base_policy` | Its weights were **never released**. Use it only inside mismatch/hallucination cases — claiming to have fine-tuned an unreleased model is itself a detectable red flag. |
-| Write `YOLOv11` as canonical | Ultralytics dropped the "v": **`YOLO11`**. Keep `YOLOv11` in the normalization alias table as the *common error* — that is exactly what makes the exercise non-trivial. |
-| Reference `ROS 2 Humble` as current | **`ROS 2 Jazzy`** (LTS to May 2029). Humble hits EOL May 2027. |
-| Include aquaculture as a sub-sector | Excluded. It is marine robotics — different locomotion medium, sonar rather than RGB-D, no GNSS underwater. |
-| Invent niche tasks | Use only the verified list in §6. Truffle detection (sensing, not robotics) and micro-green thinning (not a real operation) were removed for cause. |
-
-**The honest thesis, which belongs in your First Principles section:** a full-text grep of the
-field's current survey returns **zero** occurrences of "agricultur", "farm", "orchard", or "crop".
-Every available VLA fact — OpenVLA, π0, Octo, Open X-Embodiment, DROID, LIBERO, CALVIN — comes from
-**indoor, tabletop, short-horizon manipulation research**. Agriculture is outdoor, long-horizon,
-safety-critical, GNSS-dependent, weather-coupled, and acts on deformable biological targets with
-seasonal non-stationarity. That gap is **the justification for this project**, not a weakness to
-conceal. Presenting tabletop benchmark numbers as though they characterized field-robot capability
-is the single thing that would discredit the whole deliverable to a domain reader.
-
----
-
-## 🎯 Project Goal
-
-Build a production-grade synthetic data pipeline that generates, validates, and analyzes
-**robot-deployment-dossier ↔ field-task-order** pairs using LLMs. Your system acts as an
-intelligent deployment advisor that identifies capability mismatches, detects quality issues, and
-provides actionable feedback.
-
-**Core Challenge**: Create a system that not only generates realistic data but also understands
-what makes a robot deployment proposal "good" or "bad" for a specific agricultural task, then
-prove it works through rigorous evaluation.
-
----
+***
 
 ## 🧠 The Problem Context
 
-Growers and farm co-operatives evaluating field automation receive dozens of vendor proposals for
-each operation they want to automate. Most are poorly matched: the platform cannot physically
-perform the task, the claimed autonomy exceeds what the system has demonstrated, or the reported
-capability derives from simulation benchmarks with poor correlation to field performance.
+A grower co-op planning next season publishes field task requisitions: *selective strawberry harvest across 12 ha of polytunnel, June–September, must tolerate occlusion, minimum conditional autonomy.* Robotics vendors and system integrators respond with capability dossiers for their VLA-equipped platforms.
 
-This is a real and documented problem. VLA policies routinely score 90–95% on standard
-manipulation benchmarks while spanning the entire spectrum of real-world success. A dossier can be
-entirely truthful about its benchmark numbers and still be useless as a predictor of field
-behaviour.
+Those dossiers are sales documents. Vendors routinely claim capabilities their policies do not have — "handles any crop, any field condition, zero supervision required." A procurement team receives dozens per requisition. Most are poorly matched: wrong capabilities, mismatched autonomy levels, or filled with agtech marketing jargon and fabricated deployment history.
 
-Your task: build an AI system that can
+Your task: Build an AI system that can:
 
-* **Generate** realistic dossier–task pairs with varying quality levels
+* **Generate** realistic task-dossier pairs with varying quality levels
 * **Validate** that data follows strict structural rules
-* **Analyze** why a dossier fails to match a task (capability gap? autonomy mismatch? unsupported
-  claims? physically impossible platform/task combination?)
+* **Analyze** why a dossier fails to match a task (capability gap? autonomy mismatch? overclaiming?)
 * **Visualize** patterns in failures across different scenarios
 * **Correct** invalid data through iterative LLM feedback
 * **Serve** this intelligence via a REST API for real-time analysis
 
----
+***
+
+## 🔀 Domain Crosswalk
+
+This project is a domain adaptation of a resume/job-description analysis pipeline. Every technique, metric, threshold, and success criterion is carried over unchanged; only the domain, example data, and identifiers differ. This table is the authoritative mapping — use it whenever you need to check that an adapted requirement still corresponds to its original.
+
+| Original identifier | This project | Kind |
+| --- | --- | --- |
+| `Resume` | `RobotCapabilityProfile` | Pydantic model |
+| `JobDescription` | `FieldTaskSpec` | Pydantic model |
+| `ResumePair` | `DeploymentPair` | Pydantic model |
+| `resumes_{timestamp}.jsonl` | `profiles_{timestamp}.jsonl` | output file |
+| `jobs_{timestamp}.jsonl` | `tasks_{timestamp}.jsonl` | output file |
+| `pairs_{timestamp}.jsonl` | `pairs_{timestamp}.jsonl` | output file |
+| `POST /review-resume` | `POST /review-deployment` | endpoint |
+| `GET /health` | `GET /health` | endpoint |
+| `GET /analysis/failure-rates` | `GET /analysis/failure-rates` | endpoint |
+| skills | capabilities | concept |
+| skills overlap | capability overlap | failure metric |
+| seniority level | autonomy level | ordinal scale |
+| experience years | field seasons | scalar quantity |
+| `is_niche_role` | `is_niche_task` | boolean flag |
+| hallucinated skills | overclaimed capabilities | failure metric |
+| career-changer template | cross-domain transfer template | prompt template |
+| GPA | `benchmark_gpa` | bounded float 0.0–4.0 |
+
+All other names, thresholds, file formats, and section structures are unchanged from the original.
+
+***
 
 ## 🔁 System Architecture Overview
 
-**1. Generation**: Generate field task orders (with niche-task detection) → Generate deployment
-dossiers with controlled fit levels per task → Create dossier–task pairs with metadata
+Your pipeline should follow this high-level flow:
 
-**2. Validation**: Schema validation (Pydantic models) → Error extraction and categorization →
-Save valid/invalid records separately
+**0. Grounding**: Build the vocabulary snapshot once (see next section) → commit it → all later stages read only the snapshot
 
-**3. Analysis**: Calculate failure metrics (Jaccard, season gaps, platform contradictions) →
-Optional LLM-as-Judge for subtle quality issues → Generate correlation matrices and heatmaps
+**1. Generation**: Generate field task specs (with niche task detection) → Generate capability profiles with controlled fit levels per task → Create task-profile pairs with metadata
 
-**4. Correction (Optional)**: Feed validation errors back to LLM → Re-validate corrected outputs →
-Track correction success rates
+**2. Validation**: Schema validation (Pydantic models) → Error extraction and categorization → Save valid/invalid records separately
 
-**5. API Exposure**: `POST /review-deployment` → `GET /health` → `GET /analysis/failure-rates`
+**3. Analysis**: Calculate failure metrics (Jaccard, season gaps, etc.) → Optional LLM-as-Judge for subtle quality issues → Generate correlation matrices and heatmaps
 
----
+**4. Correction (Optional)**: Feed validation errors back to LLM → Re-validate corrected outputs → Track correction success rates
+
+**5. API Exposure**: POST /review-deployment (analyze profile against task) → GET /health (health check) → GET /analysis/failure-rates (aggregate statistics)
+
+***
+
+## 🌱 The Vocabulary Snapshot
+
+Generated data is only as good as the vocabulary it draws from. If you invent the capability names yourself, your normalization logic will be solving a mess you created — which proves nothing. Instead, seed the vocabulary from a real, public, downloadable index of agricultural ML datasets, then let the LLM generate freely from that seed.
+
+### Scope: vocabulary only
+
+**The snapshot seeds vocabulary. Nothing else.** Specifically:
+
+* ✅ Use it to draw crop names, field operations, and capability names
+* ✅ Use it to derive the `is_niche_task` flag from measured crop rarity
+* ✅ Use it to seed realistic task-instruction phrasing
+* ❌ **Do not** use dataset episode counts, robot types, or any other metadata as a ground-truth oracle for hallucination detection
+
+That last exclusion is deliberate. Hallucination detection in this project is **rule-based**, exactly as in the original — pattern matching over proficiency distributions, absolutist phrasing, and timeline arithmetic. Using real dataset metadata as an oracle would replace the technique you are supposed to be building.
+
+### Sources
+
+Two public HuggingFace collections. Both were fetched and verified on 2026-08-08; re-fetch before relying on the figures below.
+
+**1. `Project-AgML/*` — 274 agricultural datasets.** Fetch the index:
+
+```
+https://huggingface.co/api/datasets?author=Project-AgML&limit=1000
+```
+
+Dataset names follow a `{crop}_{operation}_{qualifier}` convention, yielding three vocabularies:
+
+* **Crops** (~95 distinct): apple, tomato, grape, rice, soybean, wheat, strawberry, sugarbeet, cotton, maize… down to agarwood, betel, taro, jujube, custard apple, moringa, centella asiatica
+* **Operations**: detection, segmentation, classification, counting, maturity, ripeness, grading, quality, disease, weed, pruning, damage
+* **Qualifiers**: spain, usa, brazil, germany, greece, minnesota, californiaday, californianight, australia, denmark, bangladesh, vietnam, iraq, uganda, drone, uav, thermal, synthetic
+
+**2. Agricultural LeRobot manipulation datasets.** Fetch `meta/info.json` and `meta/tasks.parquet` from each:
+
+| Dataset ID | `robot_type` | Episodes | Frames | Tasks |
+| --- | --- | --- | --- | --- |
+| `Faless/harvest_apples_with_agilex_piper_sim_ee_paraphrases20` | `piper_full` | 600 | 1,020,000 | 20 |
+| `tomato-store/bi_arm_harvest` | `bi_so_follower` | 100 | 115,069 | 1 |
+| `HojinJung/IsaacSim_apple_harvesting_20260707` | `rb10_1300e` | 127 | 49,933 | 1 |
+
+Note that in LeRobot v3.0 the task string is the **index** of `tasks.parquet`, not a column — read with `pd.read_parquet(path).reset_index()`. Verified task strings include:
+
+```
+'Pick each red apple and place it into the green basket.'
+'Harvest the red apples one by one and deposit them in the green basket.'
+'Sequentially pick the red apples and put each one into the green basket.'
+'harvest tomatoes.'
+'harvest the target apple'
+```
+
+The first dataset carries 20 paraphrases of a single instruction. Use them as a reference for what *natural* task language sounds like — it is the baseline your awkward-language detector measures marketing copy against.
+
+### Build script and caching
+
+Write `scripts/build_vocabulary.py` that fetches both sources and writes `data/vocabulary_snapshot.json`. **Commit that snapshot.** The pipeline must read only the committed file, never the network. This keeps runs reproducible, keeps your success metrics from shifting between runs, and lets the whole pipeline run offline. Refreshing the snapshot is an explicit, logged action — record it in your iteration log like any other configuration change.
+
+### Deriving `is_niche_task`
+
+Count how many datasets in the AgML index mention each crop. The distribution is a clean long tail — measured on the 2026-08-08 snapshot:
+
+| Crop | Datasets |
+| --- | --- |
+| weed | 18 |
+| grape | 12 |
+| banana | 12 |
+| rice | 9 |
+| tomato, date, soybean, apple | 7 |
+| mango, tea, bean | 6 |
+| cowpea, pomegranate, maize, guava, strawberry | 5 |
+| … | … |
+| agarwood, jujube, taro, moringa, custard apple, sapota, cocoa | 1 |
+
+Set the threshold at **≤ 2 datasets → niche**. On this snapshot that classifies roughly 60 of ~95 crops as niche while the standard crops account for the large majority of datasets — a realistic head-and-tail split. Record the threshold in your iteration log and tune it if your niche/standard task counts come out too lopsided to compare.
+
+***
 
 ## 📊 Success Metrics
 
-### 1. Data Generation Quality
+Your system will be evaluated on these quantitative benchmarks:
 
-* Generate **50+ field task orders** across diverse agricultural sub-sectors
-* Generate **5–10 deployment dossiers per task order** with controlled fit levels:
-  * Excellent fit (80%+ capability overlap)
-  * Good fit (60–80%)
-  * Partial fit (40–60%)
-  * Poor fit (20–40%)
-  * Complete mismatch (<20%)
+### 1. **Data Generation Quality**
 
-### 2. Schema Validation Performance
+* Generate **50+ field task specs** across diverse crops and production systems
+* Generate **5-10 capability profiles per task** with controlled fit levels:
+* Excellent fit (80%+ capability overlap)
+* Good fit (60-80%)
+* Partial fit (40-60%)
+* Poor fit (20-40%)
+* Complete mismatch (\<20%)
 
-* **Target: >90% validation success rate**
-* Detailed error categorization: missing required fields · type mismatches · format violations
-  (email, dates, phone) · logical inconsistencies (`end_date` before `start_date`)
+### 2. **Schema Validation Performance**
 
-### 3. Failure Detection Accuracy
+* **Target: >90% validation success rate** for generated data
+* Detailed error categorization for failures:
+* Missing required fields
+* Type mismatches
+* Format violations (email, dates, phone)
+* Logical inconsistencies (end\_date before start\_date)
 
-Calculate all six for every pair:
+### 3. **Failure Detection Accuracy**
 
-| Metric | Calculation Method | Threshold |
-| --- | --- | --- |
-| **Capability Overlap** | Jaccard similarity: \|A ∩ B\| / \|A ∪ B\| | continuous |
-| **Field-Season Mismatch** | Years gap, or <50% of required | Binary flag |
-| **Autonomy Mismatch** | Level difference (Teleoperated=0 … Full Field Autonomy=4) | >1 level = flag |
-| **Missing Core Capabilities** | Absence of top-3 required capabilities | Binary flag |
-| **Unsupported Capability Claims** | Evaluation-validity gap, impossible timelines, platform contradictions | Binary flag |
-| **Agtech Buzzword Density** | Excessive marketing jargon, AI patterns | Binary flag |
+Your labeling system must calculate these metrics for every task-profile pair:
 
-### 4. Correction Loop Effectiveness
+| ​ | Metric                  | Calculation Method                                                              | Threshold       |
+| - | ----------------------- | ------------------------------------------------------------------------------- | --------------- |
+| ​ | **Capability Overlap**  | Jaccard similarity:                                                             | A ∩ B           |
+| ​ | **Experience Mismatch** | Field-season gap or \<50% of required                                           | Binary flag     |
+| ​ | **Autonomy Mismatch**   | Level difference (Teleop=0, Assisted=1, Supervised=2, Conditional=3, Full=4)    | >1 level = flag |
+| ​ | **Missing Core Capabilities** | Absence of top-3 required capabilities                                    | Binary flag     |
+| ​ | **Overclaimed Capabilities** | Unrealistic claims (20+ "expert" capabilities, etc.)                       | Binary flag     |
+| ​ | **Awkward Language**    | Excessive agtech buzzwords, AI patterns                                         | Binary flag     |
 
-* **Target: >50% correction success rate** · Maximum 3 retry attempts · Track attempts per
-  success and failure reasons
+### 4. **Correction Loop Effectiveness**
 
-### 5. API Performance
+* **Target: >50% correction success rate** for invalid records
+* Maximum 3 retry attempts per record
+* Track: attempts per success, failure reasons
 
-* **<2 seconds** without LLM judge · **<10 seconds** with judge · valid JSON with proper error
-  handling on all endpoints
+### 5. **API Performance**
 
----
+* Response time: **\<2 seconds** (without LLM judge)
+* Response time: **\<10 seconds** (with LLM judge enabled)
+* All endpoints return valid JSON with proper error handling
+
+***
 
 ## 🛠 Technical Requirements
 
 ### Required Technology Stack
 
-* **Python 3.10+** · **Pydantic** (schema validation with detailed error reporting) ·
-  **Instructor** (structured LLM outputs) · **LLM Provider** (Groq, OpenAI, or OpenRouter) ·
-  **Pandas** · **Matplotlib/Seaborn** · **FastAPI**
+* **Python 3.10+** - Core language
+* **Pydantic** - Schema validation with detailed error reporting
+* **Instructor** - Structured LLM outputs
+* **LLM Provider** - Groq, OpenAI, or OpenRouter for generation
+* **Pandas** - Data manipulation and analysis
+* **Matplotlib/Seaborn** - Visualization generation
+* **FastAPI** - REST API framework
 
 ### Optional Enhancements
 
-* **Braintrust** (evaluation tracking) · **Logfire** (observability) · **Pre-commit hooks**
-  (Black, Ruff, MyPy)
+* **Braintrust** - Evaluation tracking and logging
+* **Logfire** - Observability and tracing
+* **Pre-commit hooks** - Code quality (Black, Ruff, MyPy)
 
-### Environment note
+The vocabulary snapshot is built with `requests` (or `huggingface_hub`) plus `pandas`, which you already have. This is a one-time build step, not a runtime dependency of the pipeline.
 
-A conda environment named **`sdg`** already exists on this machine
-(`/home/cofuente/anaconda3/envs/sdg`, Python 3.12.13) carrying pydantic 2.13.4, instructor 1.15.1,
-groq, openai, pandas 3.0.2, matplotlib, seaborn, pytest, black and ruff. Only `fastapi` and
-`uvicorn` are missing. **Reuse it — do not create a new environment, and never install Python
-packages against the host interpreter.**
-
-```bash
-conda activate sdg
-```
-
-```bash
-pip install fastapi uvicorn
-```
-
-⚠️ pandas is at **3.0.x**. Write aggregation code against the 3.x API, not 2.x idioms.
-
----
+***
 
 ## Data Schema Requirements
 
-### `RobotDeploymentDossier` must include
+### RobotCapabilityProfile Schema Must Include:
 
-* **Operator Contact**: contact_name, email, phone, site_location (+ optional fleet_portal_url,
-  telemetry_endpoint)
-* **Policy Provenance**: base_policy, training_provider, policy_release_date (+ optional
-  field_readiness_grade, training_corpora[])
-* **Deployment History**: site_operator, deployment_role, start_date, end_date, tasks_performed[],
-  outcomes[]
-* **Capabilities**: name, proficiency_level (Demonstrated/Benchmarked/Field-Validated/
-  Production-Certified), optional validated_hours
-* **Platform**: platform_locomotion, supported_interaction_modes[], validated_environments[]
-* **Metadata**: trace_id, generated_at, prompt_template, fit_level, writing_style
+* **Vendor Info**: platform\_name, vendor\_contact\_email, support\_line, vendor\_hq\_location (+ optional repo\_url, model\_card\_url)
+* **Provenance**: base\_policy\_architecture, originating\_lab, base\_policy\_release\_date (+ optional benchmark\_gpa, pretraining\_corpora)
+* **Deployments**: site\_operator, deployment\_role, dates, tasks\_performed, field\_metrics
+* **Capabilities**: name, proficiency\_level (Beginner/Intermediate/Advanced/Expert), optional seasons
+* **Metadata**: trace\_id, generated\_at, prompt\_template, fit\_level, writing\_style
 
-### `FieldTaskOrder` must include
+### FieldTaskSpec Schema Must Include:
 
-* **Operation**: grower_name, sub_sector, operation_size, site_location
-* **Facets**: operating_environment, canopy_geometry, locomotion, interaction_mode, odd_volatility
-* **Requirements**: required_capabilities[], preferred_capabilities[], min_policy_provenance,
-  required_field_seasons, required_autonomy_level
-* **Metadata**: trace_id, generated_at, is_niche_task (boolean flag)
+* **Operation**: name, production\_system, farm\_size\_ha, field\_location
+* **Requirements**: required\_capabilities\[], preferred\_capabilities\[], minimum\_provenance, required\_field\_seasons, required\_autonomy\_level
+* **Metadata**: trace\_id, generated\_at, is\_niche\_task (boolean flag)
 
-### Validation Rules
+### Validation Rules:
 
-* Email must be valid format
-* Phone must be ≥10 characters
+* Vendor contact email must be valid format
+* Support line must be ≥10 characters
 * Dates must be ISO format
-* **`field_readiness_grade` must be 0.0–4.0**
-* **`field_seasons` must be 0–30**
-* `end_date` must be after `start_date` (if present)
+* `benchmark_gpa` must be 0.0-4.0
+* Field seasons must be 0-30
+* end\_date must be after start\_date (if present)
 
-> **On `field_readiness_grade`:** this is a project-defined field on a 0.0–4.0 scale. It exists to
-> exercise bounded-float validation. **No standard defines it**, and no citation should be attached
-> to it. See §0.
+**On `benchmark_gpa`**: this is a composite grade across an evaluation suite, defined as the weighted mean of per-task-family letter grades (A=4.0 … F=0.0). The 0.0–4.0 scale is retained deliberately so the bounded-float validation rule is identical to the original. It is a project-defined construct, not a published metric.
 
-### Valid `base_policy` values
+***
 
-`OpenVLA-7B` · `OpenVLA-OFT` · `π0` · `Octo-Base` · `Octo-Small`
+## 🧭 Project-Defined Scales
 
-Octo is a 2024-era baseline — realistic as a *legacy* choice, not a current frontier one.
-`RT-2-X` is real but its weights were never released; use it only to seed hallucination cases.
+Two ordinal scales in this project are **defined by this project and by nothing else**. They are not drawn from, aligned with, or intended to represent any published standard, regulation, or classification scheme. Do not cite an external authority for them, and do not let generated text imply one.
 
-**Do not extend this list without verifying against a primary source.** In particular, do not add
-`π0.5`: its weight-release status could not be established, and a `base_policy` value is a claim
-that a practitioner could obtain and fine-tune the model. Every name above was confirmed to have
-released weights.
+### Autonomy Level
 
----
+| Level | Name | Meaning |
+| --- | --- | --- |
+| 0 | Teleoperated | Human drives every motion |
+| 1 | Assisted | Human in the loop per action; robot assists |
+| 2 | Supervised | Robot executes the task; human supervises continuously and intervenes often |
+| 3 | Conditional | Robot runs the block unattended; human on call for exceptions |
+| 4 | Full | Robot runs the season-long operation unattended |
 
-## 5. The Autonomy Ladder
+Mismatch flag if `|profile_level - task_level| > 1`.
 
-```
-0  Teleoperated            — continuous human control
-1  Operator-Assisted       — human in the loop, machine assists
-2  Supervised Autonomy     — machine acts, human monitors and intervenes
-3  Conditional Autonomy    — unsupervised within a defined operating zone
-4  Full Field Autonomy     — unsupervised across zones and conditions
-```
+### Proficiency Level
 
-**Mismatch if `|dossier_level − task_level| > 1`.**
+Beginner / Intermediate / Advanced / Expert — carried over unchanged from the original. Applies to capabilities.
 
-> ⚠️ **This ladder is a project-defined synthetic taxonomy with no standards provenance.** State
-> this wherever the ladder appears. ISO 18497-1 provides a non-ordinal vocabulary and explicitly
-> disclaims levels; ISO 18497-4 explicitly declined to adopt SAE J3016's ladder; the industry
-> harmonizes on Agri-ODD, a scenario framework rather than a scale. A five-level ordinal scale is
-> required here to exercise ordinal-distance logic, so we define one and label it honestly rather
-> than borrowing authority no standard grants.
-
-**Field seasons** are the experience analogue: sum of deployment durations, with an open-ended
-deployment measured to today. Range 0–30.
-
----
-
-## 6. Taxonomy
-
-### Sub-sectors (the diversity axis — 9 values, ≥6 task orders each = 54)
-
-`row_crops` · `orchard` · `vineyard_viticulture` · `greenhouse_cea` · `livestock_dairy` ·
-`nursery_horticulture` · `silviculture` · `post_harvest_packhouse` · `specialty_high_value`
-
-*Aquaculture is deliberately excluded — see §0.*
-
-### Faceted axes (orthogonal; these drive generation and enable contradiction detection)
-
-```
-operating_environment : open_field | protected_cropping | indoor_facility | livestock_housing
-canopy_geometry       : planar_trellis | volumetric_canopy | ground_plane | none
-locomotion            : wheeled_ugv | tracked_ugv | uav | gantry | fixed_arm | rail
-interaction_mode      : sense_only | non_contact_actuation | contact_rigid | contact_compliant
-odd_volatility        : low | medium | high
-```
-
-Stratify generation across facet combinations so coverage is structural, not merely nominal.
-
-### Niche tasks (`is_niche_task = true`) — verified list only
-
-| Task | Status |
-| --- | --- |
-| Hop-trellis string-tying | Published; 97% success, 11.2 s/cycle |
-| Saffron stigma harvesting | Commercial (Dyno Robotics × Blue Red Gold) |
-| Date-palm drone pollination | Published (*Scientific Reports*) |
-| Vanilla hand-pollination | Prototype-stage |
-| Automated hive management | Commercial (Beewise BeeHome) |
-| Robotic blossom / green-fruit thinning | Published, tree fruit |
-
-Standard (non-niche) tasks: row-crop weeding, broadacre spraying, orchard mowing, greenhouse tomato
-harvest, robotic milking, packhouse grading.
-
----
+***
 
 ## 🧪 Key Implementation Challenges
 
 ### Challenge 1: Multi-Template Generation
 
-Implement **5 prompt templates** with distinct characteristics:
+Don't generate monotonous data. Implement **5+ prompt templates** with distinct characteristics:
 
-| Template | Character |
-| --- | --- |
-| `vendor_datasheet` | Formal, regulatory-submission register; spec-table dense |
-| `agtech_pitch` | Casual startup tone; benefit-led, light on numbers |
-| `model_card` | Technical; architecture, action space, eval protocol, ablations |
-| `field_trial_metrics` | Achievement-focused; ha/hr, success rate, intervention rate |
-| `cross_embodiment` | A tabletop/warehouse-trained policy pitched for field work, emphasizing transferable skills |
+* **Vendor formal** — RFP-response register, corporate and hedged
+* **Pilot-deck casual** — startup field-notes tone, first person, informal
+* **Engineering datasheet** — technical and detail-heavy; sensors, actuators, latency, payload
+* **Benchmark-driven** — achievement-focused; throughput, damage rate, uptime, pick success
+* **Cross-domain transfer** — a warehouse or indoor-manipulation platform pivoting into agriculture, arguing transferable capabilities
 
-**Why it matters**: real proposals have diverse registers. Your failure detection must work across
-all of them. `cross_embodiment` is the most valuable of the five — cross-embodiment transfer is a
-live research concern, and these dossiers should be genuinely *hard* to judge, not obviously bad.
+**Why it matters**: Real vendor dossiers have diverse registers. Your failure detection must work across all of them. The cross-domain transfer template is the hardest case by design — it argues for fit that the capability sets do not directly support.
 
 ### Challenge 2: Controlled Fit Level Generation
 
-Generating a "poor fit" dossier is harder than it sounds:
+Generating a "poor fit" dossier is harder than it sounds. You must:
 
 * Intentionally create capability gaps
 * Misalign autonomy levels
 * Introduce subtle mismatches (not obvious failures)
 
+Domain-specific subtlety worth using: a platform with excellent capability overlap but for the wrong **production system** — a field-grown row-crop platform bid against a polytunnel task. Or right crop, right operation, wrong season window.
+
+**Why it matters**: Your labeling system needs challenging test cases to prove it works.
+
 ### Challenge 3: Capability Normalization
 
-`RTK-GPS`, `RTK GNSS`, and `rtk positioning` should all match. Implement:
+`strawberry_detection_2022`, `strawberry_detection_2023`, and `Strawberry Detection` should all match. Implement normalization:
 
 * Lowercase conversion
-* Version-number removal — `ROS 2 Jazzy` → `ros`, `YOLO11` → `yolo`, `SAM 2` → `sam`,
-  `OpenVLA-7B` → `openvla`
-* Suffix stripping — `_control`, `-perception`, ` module`, ` stack`, ` pipeline`, ` node`
-* **An alias table for canonical ↔ wrong-variant pairs** — `yolov11 → yolo11`,
-  `rtk-gps → rtk gnss`, `ros2 → ros 2`, `segment-anything → sam`
+* Version and year removal
+* Suffix and prefix stripping (geography, modality, dataset acronyms)
 
-**Why it matters**: without normalization, Jaccard similarity is artificially low. This domain is
-version-dense *and* carries genuinely wrong variants in circulation, which is what makes the alias
-table earn its place.
+The AgML index supplies real naming noise — every example below is an actual dataset name from the snapshot:
 
-### Challenge 4: Unsupported-Claim Detection
+```
+strawberry_detection_2022  /  strawberry_detection_2023        ← year suffixes
+riseholme_strawberry_classification_2021                        ← institution prefix + year
+betel_leaf_disease_classification  /  ..._2                     ← numeric disambiguators
+MH_Weed16_weed_detection                                        ← acronym prefix + version
+GHAI_/ ghai_broccoli_detection  vs  GEMINI_cowpea_flower_detection  ← case inconsistency
+wGrapeUNIPD-DL_white_grape_bunch_detection                      ← mixed-case hyphenated prefix
+weed_crop_detection / crop_weeds_greece / carrot_weeds_germany  ← singular-plural drift
+potato_leaf_blight  /  potato_leaf_blight_classification        ← near-duplicates
+apple_detection_spain / apple_detection_usa / apple_detection_drone_brazil  ← geography + modality
+vegann_mulitcrop_presence_segmentation                          ← typo in the wild ("mulitcrop")
+growliflower_caluiflower_segmentation                           ← typo in the wild ("caluiflower")
+```
 
-Rule-based detection. Cover these patterns:
+**Why it matters**: Without normalization, Jaccard similarity will be artificially low. The last two lines matter especially — real label sets contain typos, and a normalizer that assumes clean input will silently under-count matches.
 
-* Dossier with <2 field seasons claiming `Production-Certified` on 10+ capabilities
-* Dossier listing 30+ capabilities with most marked `Production-Certified`
-* Phrases: `fully autonomous in all crops`, `zero human intervention`, `100% detection accuracy`,
-  `works in any weather`, `no calibration required`
-* **Timeline impossibility**: overlapping deployments at geographically incompatible sites;
-  `validated_hours` exceeding the wall-clock span of the deployment window
-* **Platform/task contradiction** — computable from the schema alone, no external data:
-  * `uav` claiming `contact_compliant` manipulation
-  * `gantry` claiming `open_field` operation at scale
-  * `indoor_facility` deployment claiming `high` ODD volatility
-  * `fixed_arm` claiming multi-hectare coverage
-  * `sense_only` platform claiming harvesting or weeding outcomes
-* **Evaluation-validity gap**: `training_corpora` is simulation-only while capabilities claim
-  `Field-Validated`; or `base_policy` names a model with no released weights
+### Challenge 4: Overclaim (Hallucination) Detection
 
-Frame this in prose as an **evaluation-validity gap**, not vendor dishonesty. See §0.
+Rule-based detection is tricky. Consider these patterns:
 
-### Challenge 5: Agtech Buzzword Detection
+* Entry-level platform (\<2 field seasons) claiming "Expert" in 10+ capabilities
+* Profile listing 30+ capabilities with most marked "Expert"
+* Phrases like "handles all crops", "any field condition", "zero supervision required", "100% pick accuracy"
+* Inconsistent timelines (overlapping deployments at two sites in the same season, impossible progressions)
 
-* Repeated marketing jargon: `revolutionize`, `game-changing`, `AI-powered`, `end-to-end`,
-  `seamlessly`, `next-generation`, `holistic`, `synergy`, `digital transformation`,
-  `unlock value`, `future-proof`
-* Repetitive patterns: same token 3+ times in close proximity
-* Excessive density: >5 buzzwords in a summary/description
+Two rules the agricultural domain donates, both pure arithmetic over fields you already have:
 
----
+* **Deployment predating provenance** — a deployment window that starts before `base_policy_release_date`. A platform cannot have delivered 2023 field results on a policy released in 2025.
+* **Out-of-window harvest** — a harvest deployment claimed outside the crop's plausible season. Requires only a small project-defined crop→season table; keep it in the snapshot file alongside the vocabulary.
+
+**Why it matters**: LLMs hallucinate, and so do vendors. Your system must catch it. Keep this rule-based — do not reach for the dataset metadata as an oracle.
+
+### Challenge 5: Awkward Language Detection
+
+Identify AI-generated or buzzword-heavy text using pattern matching:
+
+* Repeated agtech jargon: "revolutionary", "AI-powered", "farm of the future", "digital transformation", "end-to-end autonomy", "precision at scale", "game-changing", "seamlessly integrates", "unlock the potential of your fields"
+* Repetitive patterns: same word 3+ times in close proximity
+* Excessive buzzword density: >5 buzzwords in summary/description
+
+Calibrate against the verified LeRobot task strings, which are plain and concrete ("Pick each red apple and place it into the green basket."). That register is your negative control — a description that drifts far from it is the signal.
+
+**Why it matters**: Distinguishes substantive capability claims from low-quality AI-generated marketing copy.
+
+***
 
 ## 📦 Deliverables
 
-### 1. Generated Data (JSONL)
+Your completed system must produce:
 
-`dossiers_{timestamp}.jsonl` · `task_orders_{timestamp}.jsonl` · `pairs_{timestamp}.jsonl`
+### 1. **Generated Data** (JSONL format)
 
-### 2. Validation Results (JSON/CSV)
+* `profiles_{timestamp}.jsonl` - All generated capability profiles
+* `tasks_{timestamp}.jsonl` - All generated field task specs
+* `pairs_{timestamp}.jsonl` - Task-profile pairs with metadata
 
-`validated_data_{timestamp}.json` · `invalid_{timestamp}.jsonl` ·
-`schema_failure_modes_{timestamp}.json`
+### 2. **Validation Results** (JSON/CSV format)
 
-### 3. Failure Analysis (JSONL)
+* `validated_data_{timestamp}.json` - Successfully validated records
+* `invalid_{timestamp}.jsonl` - Failed records with error details
+* `schema_failure_modes_{timestamp}.json` - Error analysis
 
-`failure_labels_{timestamp}.jsonl` — all calculated metrics per pair, plus overall failure rates,
-correlations, distributions
+### 3. **Failure Analysis** (JSONL format)
 
-### 4. Visualizations (PNG, in `visualizations/`)
+* `failure_labels_{timestamp}.jsonl` - All calculated metrics per pair
+* Statistics: overall failure rates, correlations, distributions
 
-### 5. REST API
+### 4. **Visualizations** (PNG format)
 
-`POST /review-deployment` · `GET /health` · `GET /analysis/failure-rates` · OpenAPI docs at `/docs`
+Generate at least these heatmaps/charts:
 
-### 6. Pipeline Summary (JSON)
+* **Failure mode correlation matrix** - Which failures co-occur?
+* **Failure rates by fit level** - Do "poor fit" profiles fail more?
+* **Failure rates by template** - Which registers cause issues?
+* **Niche vs standard tasks** - Do niche crops have different patterns?
+* **Schema validation heatmap** - Which fields fail most often?
 
-`pipeline_summary_{timestamp}.json` — total records, validation success rate, failure-mode
-distribution, correction success rate, processing time per stage
+### 5. **REST API**
 
----
+Functional FastAPI service with:
+
+* `POST /review-deployment` - Real-time profile analysis
+* `GET /health` - Health check
+* `GET /analysis/failure-rates` - Aggregate statistics
+* Automatic OpenAPI documentation at `/docs`
+
+### 6. **Pipeline Summary** (JSON format)
+
+* `pipeline_summary_{timestamp}.json` - Complete run statistics:
+* Total records generated
+* Validation success rate
+* Failure mode distribution
+* Correction success rate (if enabled)
+* Processing time per stage
+* Vocabulary snapshot version/date used
+
+***
 
 ## 🎨 Visualization Requirements
 
-Matplotlib, Seaborn, or Plotly. Save each as PNG in `visualizations/`.
+All visualizations must use **Matplotlib**, **Seaborn**, or **Plotly**. Save each as a PNG file in a `visualizations/` directory.
 
-* **Failure Mode Correlation Matrix** (heatmap) — which failure modes co-occur?
-* **Failure Rates by Fit Level** (grouped bar) — do "poor fit" dossiers fail more?
-* **Failure Rates by Template** (grouped bar) — which registers cause the most issues?
-* **Niche vs Standard Tasks** (side-by-side bar) — do niche tasks have different patterns?
-* **Schema Validation Heatmap** — which fields fail most often, by error category?
-* **Unsupported Claims by Autonomy Level** (stacked bar) — do lower-autonomy dossiers overclaim more?
+### Required Charts
 
-**Quality standards**: descriptive titles, axis labels, legends · diverging colormaps for
-correlations, sequential for rates · grid lines · annotations for key thresholds and targets.
+* **Failure Mode Correlation Matrix** (heatmap): Which failure modes co-occur across task-profile pairs?
+* **Failure Rates by Fit Level** (grouped bar chart): Do "poor fit" profiles fail more than "excellent fit" ones?
+* **Failure Rates by Template** (grouped bar chart): Which registers (vendor formal, pilot casual, datasheet, benchmark, cross-domain) cause the most issues?
+* **Niche vs Standard Tasks** (side-by-side bar chart): Do niche crops have different failure patterns?
+* **Schema Validation Heatmap** (heatmap): Which fields fail validation most often, by error category?
+* **Overclaiming by Autonomy Level** (stacked bar chart): Do low-autonomy platforms overclaim more than high-autonomy ones?
 
----
+### Quality Standards
+
+* All charts must have descriptive titles, axis labels, and legends
+* Use appropriate color schemes (diverging for correlations, sequential for rates)
+* Include grid lines for readability
+* Add annotations for key thresholds and targets
+
+***
 
 ## 🔄 Iteration Logs
 
-Every configuration or threshold change must be documented:
+Every configuration or threshold change must be documented. Use this format:
+
+```
+## Iteration Log Entry
 
 | Field | Value |
 | --- | --- |
 | Date | YYYY-MM-DD |
-| Component | Generator / Validator / Labeler / Correction Loop / API |
+| Component | (e.g., Generator, Validator, Labeler, Correction Loop, API, Vocabulary) |
 | Change | What was modified |
-| Reason | Why |
-| Before Metric | Value before |
-| After Metric | Value after |
+| Reason | Why the change was made |
+| Before Metric | Value before the change |
+| After Metric | Value after the change |
 | Delta | Improvement or regression |
 | Keep/Revert | Decision and rationale |
+```
 
-Example entries:
+Example iteration entries:
 
-| Date | Component | Change | Before | After | Delta | Decision |
-| --- | --- | --- | --- | --- | --- | --- |
-| 2026-08-10 | Generator | Added explicit ISO-date instruction to prompt | Validation: 82% | Validation: 91% | +9% | Keep |
-| 2026-08-11 | Labeler | Added alias table to capability normalization | Jaccard avg: 0.28 | Jaccard avg: 0.44 | +0.16 | Keep |
-| 2026-08-12 | Correction Loop | Included Pydantic error messages in correction prompt | Correction: 38% | Correction: 62% | +24% | Keep |
-| 2026-08-13 | Unsupported Claims | Lowered Production-Certified threshold from 15 to 10 | Detection: 45% | Detection: 72% | +27% | Keep |
+| Date       | Component       | Change                                                     | Before               | After                | Delta | Decision |
+| ---------- | --------------- | ---------------------------------------------------------- | -------------------- | -------------------- | ----- | -------- |
+| 2026-01-15 | Generator       | Added explicit ISO date format instruction to prompt       | Validation: 82%      | Validation: 91%      | +9%   | Keep     |
+| 2026-01-16 | Labeler         | Added year-suffix stripping to capability normalization    | Jaccard avg: 0.28    | Jaccard avg: 0.41    | +0.13 | Keep     |
+| 2026-01-17 | Correction Loop | Included Pydantic error messages in correction prompt      | Correction rate: 38% | Correction rate: 62% | +24%  | Keep     |
+| 2026-01-18 | Overclaim       | Lowered expert-capability threshold from 15 to 10          | Detection: 45%       | Detection: 72%       | +27%  | Keep     |
+| 2026-01-19 | Vocabulary      | Raised niche crop threshold from ≤1 to ≤2 datasets         | Niche tasks: 8%      | Niche tasks: 24%     | +16%  | Keep     |
 
-**At least 3 entries required**, and final configuration decisions must be traceable to specific
-entries.
-
----
+***
 
 ## 🔄 Correction Loop Strategy
 
-* **Extract Error Context**: field path, error type, invalid value, expected format
-* **Construct Correction Prompt**: `The following data failed validation with these errors:
-  [error details] Original data: [invalid data] Please generate a corrected version that fixes
-  these issues.`
-* **Re-validate**: parse corrected output and validate again
-* **Retry Logic**: up to 3 attempts, then mark permanently failed
-* **Track Statistics**: success rate, average attempts, common failure reasons
+When validation fails, your system should:
 
-**Success Criteria**: >50% of invalid records corrected within 3 attempts.
+* **Extract Error Context**: Field path, error type, invalid value, expected format
+* **Construct Correction Prompt**: `The following data failed validation with these errors: [error details] Original data: [invalid data] Please generate a corrected version that fixes these issues.`
+* **Re-validate**: Parse corrected output and validate again
+* **Retry Logic**: Up to 3 attempts, then mark as permanently failed
+* **Track Statistics**: Success rate, average attempts, common failure reasons
 
----
+**Success Criteria**: >50% of invalid records successfully corrected within 3 attempts.
+
+***
 
 ## 🧠 LLM-as-Judge (Advanced Feature)
 
-Evaluates: **unsupported claims** (unverifiable assertions, timeline inconsistencies) ·
-**awkward language** (excessive jargon, AI patterns) · **fit assessment** (holistic capability and
-platform alignment) · **red flags** (deployment gaps, inconsistent capability progression,
-sim-only evidence presented as field evidence).
+For subtle quality issues that rule-based systems miss, implement an LLM judge that evaluates:
 
-```json
+### Evaluation Criteria:
+
+* **Hallucinations**: Unverifiable capability claims, timeline inconsistencies
+* **Awkward Language**: Excessive jargon, unnatural phrasing, AI patterns
+* **Fit Assessment**: Holistic capability and deployment-history alignment
+* **Red Flags**: Gaps between deployments, autonomy regressions, unexplained site churn
+
+### Output Schema:
+
+```
 {
-  "has_unsupported_claims": true,
-  "unsupported_claim_details": "string (explanation)",
-  "has_awkward_language": false,
+  "has_hallucinations": boolean,
+  "hallucination_details": "string (explanation)",
+  "has_awkward_language": boolean,
   "awkward_language_details": "string (explanation)",
-  "overall_quality_score": 0.0,
+  "overall_quality_score": 0.0-1.0,
   "fit_assessment": "narrative assessment",
   "recommendations": ["actionable suggestions"],
   "red_flags": ["concerns identified"]
 }
 ```
 
-**Trade-off**: ~5–10 s per pair. Make it optional (enable/disable per request).
+**Trade-off**: LLM judge is slower (\~5-10s per pair) but catches nuanced issues. Make it optional.
 
----
+***
 
 ## 🎯 Evaluation Approach
 
-Record every result in your iteration log.
+Follow these steps in order. Record every result in your iteration log.
 
-### Step 1: Validate Generation Volume and Diversity
+### Step 1: Validate Data Generation Volume and Diversity
 
-50+ task orders across 9 sub-sectors; 5–10 dossiers each; verify all 5 fit levels and all 5
-templates.
+Generate at least 50 field task specs across diverse crops and production systems. For each task, generate 5-10 capability profiles with controlled fit levels. Verify coverage of all 5 fit levels and all 5 prompt templates.
 
-| Fit Level | Count | % of Total | Avg Capability Overlap |
-| --- | --- | --- | --- |
-| Excellent (80%+) | 55 | 22% | 0.87 |
-| Good (60–80%) | 52 | 21% | 0.71 |
-| Partial (40–60%) | 50 | 20% | 0.49 |
-| Poor (20–40%) | 48 | 19% | 0.31 |
-| Mismatch (<20%) | 45 | 18% | 0.12 |
+Example output:
 
-**If any fit level has <15% of total pairs**, adjust generation distribution weights.
-**If total pairs <250**, increase task orders or dossiers per order.
+| Fit Level        | Count | % of Total | Avg Capability Overlap |
+| ---------------- | ----- | ---------- | ---------------------- |
+| Excellent (80%+) | 55    | 22%        | 0.87                   |
+| Good (60-80%)    | 52    | 21%        | 0.71                   |
+| Partial (40-60%) | 50    | 20%        | 0.49                   |
+| Poor (20-40%)    | 48    | 19%        | 0.31                   |
+| Mismatch (\<20%) | 45    | 18%        | 0.12                   |
+
+**If any fit level has \< 15% of total pairs**, adjust the generation distribution weights. **If total pairs \< 250**, increase the number of tasks or profiles per task.
 
 ### Step 2: Check Schema Validation Rate
 
-Target >90%. Categorize failures.
+Run all generated records through Pydantic validation. Target > 90% pass rate. Categorize failures by error type.
 
-| Error Category | Count | % of Failures | Most Common Field |
-| --- | --- | --- | --- |
-| Missing required fields | 12 | 40% | deployment_history.outcomes |
-| Type mismatches | 8 | 27% | capabilities.proficiency_level |
-| Format violations | 6 | 20% | operator_contact.email |
-| Logical inconsistencies | 4 | 13% | deployment_history.end_date |
+Example output:
 
-**If <90%**, add explicit formatting instructions for the top error category. **If a single field
-is >50% of failures**, add a Pydantic field validator with a clear message.
+| Error Category          | Count | % of Failures | Most Common Field            |
+| ----------------------- | ----- | ------------- | ---------------------------- |
+| Missing required fields | 12    | 40%           | deployments.field\_metrics   |
+| Type mismatches         | 8     | 27%           | capabilities.proficiency\_level |
+| Format violations       | 6     | 20%           | vendor.vendor\_contact\_email |
+| Logical inconsistencies | 4     | 13%           | deployments.end\_date        |
+
+**If validation rate \< 90%**, inspect the top error category and add explicit formatting instructions to the generation prompt for that field. **If a single field accounts for > 50% of failures**, add a Pydantic field validator with a clear error message.
 
 ### Step 3: Verify Failure Labeling Accuracy
 
-Manually spot-check 10+ pairs across all six metrics.
+Manually spot-check 10 task-profile pairs. Verify Jaccard similarity, experience mismatch, autonomy mismatch, missing core capabilities, overclaiming, and awkward language flags are calculated correctly.
 
-| Pair ID | Jaccard | Season Mismatch | Autonomy Mismatch | Missing Core | Unsupported | Buzzwords | Manual Agrees? |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| pair_001 | 0.33 | Yes | No | Yes | No | No | Yes |
-| pair_002 | 0.85 | No | No | No | No | No | Yes |
-| pair_003 | 0.12 | Yes | Yes | Yes | Yes | Yes | Yes |
+Example output:
 
-**If manual agreement <80%**, review normalization logic. **If unsupported-claim detection misses
-obvious cases**, add pattern rules — start with the platform contradictions, which are the most
-reliable.
+| Pair ID   | Jaccard | Exp Mismatch | Autonomy Mismatch | Missing Core | Overclaim | Awkward Lang | Manual Agrees? |
+| --------- | ------- | ------------ | ----------------- | ------------ | --------- | ------------ | -------------- |
+| pair\_001 | 0.33    | Yes          | No                | Yes          | No        | No           | Yes            |
+| pair\_002 | 0.85    | No           | No                | No           | No        | No           | Yes            |
+| pair\_003 | 0.12    | Yes          | Yes               | Yes          | No        | Yes          | Yes            |
 
-### Step 4: Test Correction Loop
+**If manual agreement \< 80%**, review the normalization logic for capability matching. **If overclaim detection misses obvious cases**, add more pattern rules (e.g., entry-level with 10+ expert capabilities).
 
-Target >50% within 3 attempts.
+### Step 4: Test Correction Loop Effectiveness
 
-| Attempt | Records In | Corrected | Still Invalid | Success Rate |
-| --- | --- | --- | --- | --- |
-| 1 | 30 | 18 | 12 | 60% |
-| 2 | 12 | 5 | 7 | 42% |
-| 3 | 7 | 2 | 5 | 29% |
-| **Total** | **30** | **25** | **5** | **83%** |
+Run the correction loop on all invalid records. Target > 50% correction success within 3 attempts.
 
-**If <50%**, include specific Pydantic error messages and expected format in the prompt. **If
-failures persist across all 3**, check whether the error is something an LLM can reasonably fix.
+Example output:
+
+| Attempt   | Records In | Corrected | Still Invalid | Success Rate |
+| --------- | ---------- | --------- | ------------- | ------------ |
+| 1         | 30         | 18        | 12            | 60%          |
+| 2         | 12         | 5         | 7             | 42%          |
+| 3         | 7          | 2         | 5             | 29%          |
+| **Total** | **30**     | **25**    | **5**         | **83%**      |
+
+**If overall correction rate \< 50%**, improve the correction prompt by including the specific Pydantic error messages and the expected format. **If most failures persist across all 3 attempts**, check whether the error type is something the LLM can reasonably fix (e.g., logical date ordering vs. missing domain knowledge).
 
 ### Step 5: Validate API Performance
 
-| Endpoint | Payload | Response Time | Status | Edge Case Handled? |
-| --- | --- | --- | --- | --- |
-| POST /review-deployment | Full pair (no judge) | 1.2s | 200 | N/A |
-| POST /review-deployment | Full pair (with judge) | 7.8s | 200 | N/A |
-| POST /review-deployment | Empty capabilities list | 0.8s | 200 | Yes |
-| POST /review-deployment | Missing fields | 0.3s | 422 | Yes |
-| GET /health | N/A | 0.1s | 200 | N/A |
-| GET /analysis/failure-rates | N/A | 0.5s | 200 | N/A |
+Test each endpoint with representative payloads. Measure response times and verify error handling for edge cases.
 
-**If >2s without judge**, profile and cache repeated computations. **If edge cases 500**, add
-input validation with informative errors.
+Example output:
+
+| Endpoint                    | Payload                     | Response Time | Status | Edge Case Handled? |
+| --------------------------- | --------------------------- | ------------- | ------ | ------------------ |
+| POST /review-deployment     | Full pair (no judge)        | 1.2s          | 200    | N/A                |
+| POST /review-deployment     | Full pair (with judge)      | 7.8s          | 200    | N/A                |
+| POST /review-deployment     | Empty capabilities list     | 0.8s          | 200    | Yes                |
+| POST /review-deployment     | Missing fields              | 0.3s          | 422    | Yes                |
+| GET /health                 | N/A                         | 0.1s          | 200    | N/A                |
+| GET /analysis/failure-rates | N/A                         | 0.5s          | 200    | N/A                |
+
+**If response time > 2s without judge**, profile the analysis pipeline and cache repeated computations. **If edge cases return 500 errors**, add input validation middleware with informative error messages.
 
 ### Step 6: Self-Evaluation Questions
 
-* Can you explain why a "poor fit" dossier was labeled as such?
-* Do your visualizations reveal non-obvious patterns (template bias, niche-task difficulty)?
-* Does the correction loop improve data quality, or just mask errors?
+After completing steps 1-5, answer these questions honestly:
+
+* Can you explain why a "poor fit" profile was labeled as such?
+* Do your visualizations reveal non-obvious patterns (e.g., template bias, niche crop challenges)?
+* Does the correction loop actually improve data quality, or does it just mask errors?
 * Can the API handle edge cases (empty capabilities, missing fields, malformed JSON)?
 * Are failure modes distributed as expected across fit levels?
+* Does the cross-domain transfer template fail differently from the others, and can you say why?
 
----
+***
 
 ## 💡 First Principles
 
-**Why synthesize this data at all?** Because it does not exist. Every VLA fact available — OpenVLA,
-π0, Octo, Open X-Embodiment, DROID, LIBERO, CALVIN — comes from indoor tabletop manipulation
-research. There is essentially no VLA corpus for agriculture, and real field-deployment records are
-commercially confidential. Synthetic generation produces hundreds of diverse examples at low cost
-while controlling for fit level, register, and capability distribution. The tradeoff is drift from
-reality, which is why validation and failure detection are essential.
+**Why generate synthetic task-profile pairs instead of using real data?** Real procurement dossiers are commercially sensitive and expensive to collect, and there is no public corpus of them. Synthetic generation lets you produce hundreds of diverse examples at low cost while controlling for specific quality dimensions (fit level, register, capability distribution). The tradeoff is that synthetic data can drift from reality, which is why validation and failure detection are essential — and why the vocabulary is anchored to a real dataset index rather than invented wholesale.
 
-**Why Pydantic rather than manual checks?** Manual validation is error-prone and hard to maintain.
-Pydantic enforces rules at the schema level, catches type mismatches automatically, and produces
-detailed error messages that feed directly into the correction loop.
+**Why anchor the vocabulary to a real index but still generate synthetically?** Because the two failure modes are different. Inventing the vocabulary yourself makes Challenge 3 circular: you create the naming mess, then solve it, and learn nothing about whether your normalizer survives contact with real label noise. Anchoring the vocabulary while generating the records keeps the exercise synthetic — you retain full control over fit levels and quality dimensions — but forces the normalizer to handle year suffixes, acronym prefixes, and typos that actually exist.
 
-**Why six failure modes rather than one quality score?** A single score hides the structure of the
-problem. If 80% of failures are platform contradictions, that needs a different fix than if they
-are spread evenly. Separate metrics let you target corrections and measure whether each fix worked.
+**Why use Pydantic for validation instead of manual checks?** Manual validation is error-prone and hard to maintain. Pydantic enforces structural rules at the schema level, catches type mismatches automatically, and produces detailed error messages that can be fed back into the correction loop. It turns validation from a manual review step into an automated, repeatable process.
 
-**Why a correction loop?** Generation is imperfect. Feeding validation errors back gives the LLM a
-chance to fix specific issues, mirroring real pipelines where automated repair is cheaper than
-regeneration. Tracking success rates tells you whether it helps or merely masks.
+**Why measure 6 failure modes separately instead of a single quality score?** A single score hides the structure of the problem. If 80% of your failures come from overclaimed capabilities, that requires a different fix than if failures are spread evenly across all modes. Separate metrics let you target corrections precisely and measure whether each fix actually worked.
 
-**Why expose an API?** A batch script is useful for analysis but not for real-time applications.
-Wrapping the logic in REST makes it usable by other systems and forces you to handle edge cases,
-error responses, and performance constraints that batch processing can ignore.
+**Why include a correction loop?** Generation is imperfect. Rather than discarding every invalid record, feeding validation errors back to the LLM gives it a chance to fix specific issues. This mirrors real-world data pipelines where automated repair is cheaper than regeneration. Tracking correction success rates tells you whether the loop is actually helping or just masking problems.
 
-**Why do the platform contradiction rules matter more than they look?** They are the only failure
-signal computable entirely from the record itself, with no external database. A UAV cannot perform
-compliant contact manipulation; a gantry cannot cover open field at scale. These are physical
-facts, not statistical tendencies — which makes them the most reliable ground truth in the system.
+**Why expose the system as an API?** A pipeline that only runs as a batch script is useful for analysis but not for real-time applications. Wrapping the analysis logic in a REST API makes it usable by other systems (e.g., a procurement tool that screens dossiers on submission). It also forces you to handle edge cases, error responses, and performance constraints that batch processing can ignore.
 
----
+***
 
 ## 💡 Bonus Challenges (Optional)
 
-1. **Multi-hop evaluation questions** — "Does this platform's locomotion mode support the
-   interaction mode the task requires?" · "Are the claimed capabilities consistent with the
-   deployment roles and outcomes?"
-2. **Feedback classification** — thumbs up/down on API responses, logged to Braintrust
-3. **Advanced RAG** — vector-store the dossiers, implement "find similar platforms"
-4. **Prompt template optimization** — A/B test templates, measure validation rates
-5. **Synthetic data augmentation** — generate corrected versions of failed dossiers, compare
-   failure rates before/after
+If you want to go beyond the baseline:
 
----
+### 1. **Multi-Hop Questions for Evaluation**
+
+Generate test questions that require understanding multiple profile sections:
+
+* "Does this platform's provenance and deployment history align with the task's required autonomy level?"
+* "Are the claimed capabilities consistent with the deployment roles and field metrics reported?"
+
+### 2. **Feedback Classification**
+
+Add thumbs up/down feedback mechanism to API responses, log to Braintrust for continuous improvement.
+
+### 3. **Advanced RAG Integration**
+
+Store capability profiles in a vector database, implement semantic search for "find similar platforms".
+
+### 4. **Prompt Template Optimization**
+
+A/B test different prompt templates, measure which produces highest validation rates.
+
+### 5. **Synthetic Data Augmentation**
+
+Generate "corrected" versions of failed profiles, compare failure rates before/after.
+
+### 6. **Vocabulary Sensitivity Analysis**
+
+Re-run the pipeline against a deliberately *unnormalized* vocabulary and measure how much average Jaccard drops. This quantifies exactly what Challenge 3 buys you.
+
+***
 
 ## 🚀 Getting Started Hints
 
-### Recommended development order
+### Recommended Development Order:
 
-1. **Schemas** — Pydantic models with all validation rules
-2. **Generators** — one template first
-3. **Validation** — catch and categorize errors
-4. **Failure labeling** — Jaccard first, then platform contradictions (cheapest and most
-   reliable), then the rest
-5. **Visualizations** — prove the labeling works
-6. **API**
-7. **Correction loop**
-8. **Observability** — Braintrust/Logfire if desired
+* **Build the vocabulary snapshot** - Fetch once, commit, never touch the network again
+* **Define schemas** - Pydantic models with all validation rules
+* **Build generators** - Get LLM generation working with one template first
+* **Implement validation** - Ensure you can catch and categorize errors
+* **Add failure labeling** - Start with Jaccard similarity, then add other metrics
+* **Create visualizations** - Prove your labeling system works
+* **Build API** - Expose functionality for real-time use
+* **Add correction loop** - Improve data quality iteratively
+* **Integrate observability** - Add Braintrust/Logfire if desired
 
-### Common pitfalls
+### Common Pitfalls to Avoid:
 
-* **Don't hardcode prompts** — templates with variable injection
-* **Don't skip normalization** — capability matching fails without it
-* **Don't ignore edge cases** — missing fields, empty lists, nulls
-* **Don't generate all data at once** — batch with progress tracking
-* **Don't forget trace IDs** — essential for debugging and linking records
-* **Don't cite standards you haven't read** — see §0. This project has already been burned once.
+* **Don't hardcode prompts** - Use templates with variable injection
+* **Don't skip normalization** - Capability matching will fail without it
+* **Don't fetch the vocabulary at run time** - Snapshot it, or your metrics move under you
+* **Don't use dataset metadata as a hallucination oracle** - Overclaim detection is rule-based by design
+* **Don't attribute the autonomy scale to a standard** - It is project-defined; say so wherever it appears
+* **Don't ignore edge cases** - Handle missing fields, empty lists, null values
+* **Don't generate all data at once** - Use batch processing with progress tracking
+* **Don't forget trace IDs** - Essential for debugging and linking records
 
-### Storage strategy
+### Storage Strategy:
 
-**JSONL** for generated data · **JSON** for summaries · **CSV** for tabular exports · **PNG** for
-visualizations
+* Use **JSONL** for generated data (streaming-friendly, line-by-line processing)
+* Use **JSON** for summaries, analysis results, and the vocabulary snapshot
+* Use **CSV** for tabular exports (easy to load in pandas/Excel)
+* Use **PNG** for visualizations (widely compatible)
 
----
+***
 
-## 📚 Key Concepts
+## 📚 Key Concepts to Understand
 
 ### Jaccard Similarity
 
 ```
+Given two sets A and B:
 Jaccard(A, B) = |A ∩ B| / |A ∪ B|
 
-Dossier capabilities: {row following, rtk gnss, ripeness classification, compliant grasping}
-Task requirements:    {row following, rtk gnss, weed discrimination, spray actuation}
+Example:
+Profile capabilities: {strawberry_detection, ripeness_classification,
+                       selective_pick, basket_deposit}
+Task requirements:    {strawberry_detection, ripeness_classification,
+                       stem_cut_grasp, occluded_reach}
 
-Intersection: {row following, rtk gnss} = 2
-Union: {row following, rtk gnss, ripeness classification, compliant grasping,
-        weed discrimination, spray actuation} = 6
+Intersection: {strawberry_detection, ripeness_classification} = 2 items
+Union: {strawberry_detection, ripeness_classification, selective_pick,
+        basket_deposit, stem_cut_grasp, occluded_reach} = 6 items
 Jaccard = 2/6 = 0.33 (poor overlap)
 ```
 
 ### Autonomy Level Mapping
 
 ```
-Teleoperated:         0
-Operator-Assisted:    1
-Supervised Autonomy:  2
-Conditional Autonomy: 3
-Full Field Autonomy:  4
+Teleoperated:  0
+Assisted:      1
+Supervised:    2
+Conditional:   3
+Full:          4
 
-Mismatch if |dossier_level - task_level| > 1
+Mismatch if |profile_level - task_level| > 1
+
+Project-defined scale. Not derived from any published standard.
 ```
 
-*(Project-defined scale — see §5 and §0.)*
-
-### Field-Season Calculation
+### Field Experience Calculation
 
 ```
 For each deployment:
   if end_date exists:
     duration = end_date - start_date
   else:
-    duration = today - start_date   # ongoing deployment
+    duration = today - start_date  # Ongoing deployment
 
-total_field_seasons = sum(all durations)
+total_field_experience = sum(all durations)
 ```
 
----
+Report in seasons. If a deployment window spans a single growing season, count it
+as one season regardless of calendar length — a four-month harvest deployment and
+a nine-month protected-cropping deployment are both one season.
+
+### Capability Normalization
+
+```
+Raw:        "MH_Weed16_weed_detection"
+lowercase:  "mh_weed16_weed_detection"
+strip prefix acronym:   "weed16_weed_detection"
+strip version digits:   "weed_weed_detection"
+collapse repeats:       "weed_detection"
+
+Raw:        "strawberry_detection_2023"
+strip year:             "strawberry_detection"
+
+Raw:        "apple_detection_drone_brazil"
+strip geography:        "apple_detection_drone"
+strip modality:         "apple_detection"
+```
+
+***
 
 ## ✅ Final Success Criteria
 
+Before submitting, verify that your implementation meets all of the following:
+
 ### Data Generation
-* [ ] 50+ field task orders generated across diverse agricultural sub-sectors
-* [ ] 5–10 dossiers per task order with controlled fit levels (250+ total pairs)
+
+* [ ] 50+ field task specs generated across diverse crops and production systems
+* [ ] 5-10 capability profiles per task with controlled fit levels (250+ total pairs)
 * [ ] All 5 fit levels represented (excellent, good, partial, poor, mismatch)
-* [ ] All 5 prompt templates used (vendor datasheet, agtech pitch, model card, field-trial metrics, cross-embodiment)
-* [ ] Niche-task detection flag set correctly
+* [ ] All 5 prompt templates used (vendor formal, pilot casual, datasheet, benchmark-driven, cross-domain transfer)
+* [ ] Niche task detection flag set correctly
 * [ ] All records have trace IDs and timestamps
 
 ### Schema Validation
-* [ ] Pydantic models defined for RobotDeploymentDossier, FieldTaskOrder, and DeploymentPair
-* [ ] Validation rules enforced (email format, date ordering, field_readiness_grade range, etc.)
+
+* [ ] Pydantic models defined for RobotCapabilityProfile, FieldTaskSpec, and DeploymentPair
+* [ ] Validation rules enforced (email format, date ordering, benchmark\_gpa range, etc.)
 * [ ] Validation success rate > 90%
 * [ ] Error categorization by type (missing fields, type mismatches, format violations, logical inconsistencies)
 * [ ] Valid and invalid records saved separately with proper filenames
 
 ### Failure Labeling
-* [ ] All 6 failure metrics calculated for every pair (capability overlap, field-season mismatch, autonomy mismatch, missing core capabilities, unsupported claims, buzzword density)
-* [ ] Capability normalization implemented (lowercase, version removal, suffix stripping, alias table)
+
+* [ ] All 6 failure metrics calculated for every pair (capability overlap, experience mismatch, autonomy mismatch, missing core capabilities, overclaiming, awkward language)
+* [ ] Capability normalization implemented (lowercase, version/year removal, prefix and suffix stripping)
 * [ ] Jaccard similarity correctly calculated and spot-checked on 10+ pairs
-* [ ] Unsupported-claim detection covers low-season overclaiming, excessive Production-Certified ratings, impossible timelines, and platform contradictions
-* [ ] Buzzword detection catches density and repetitive patterns
+* [ ] Overclaim detection covers entry-level overclaiming, excessive expert ratings, impossible timelines
+* [ ] Awkward language detection catches buzzword density and repetitive patterns
 
 ### Correction Loop
+
 * [ ] Correction prompt includes specific Pydantic error messages
 * [ ] Maximum 3 retry attempts per record
 * [ ] Correction success rate > 50%
 * [ ] Statistics tracked (attempts per success, failure reasons)
 
 ### LLM-as-Judge
-* [ ] Evaluates unsupported claims, awkward language, fit assessment, red flags
+
+* [ ] Evaluates hallucinations, awkward language, fit assessment, red flags
 * [ ] Structured output with scores and explanations
 * [ ] Optional (can be enabled/disabled per request)
 
 ### API
-* [ ] POST /review-deployment responds in < 2s (without judge), < 10s (with judge)
+
+* [ ] POST /review-deployment responds in \< 2s (without judge), \< 10s (with judge)
 * [ ] GET /health returns health status
 * [ ] GET /analysis/failure-rates returns aggregate statistics
 * [ ] All endpoints return valid JSON with proper error handling
 * [ ] Edge cases handled (empty capabilities, missing fields, malformed input)
 
 ### Visualizations
+
 * [ ] Failure mode correlation matrix (heatmap)
 * [ ] Failure rates by fit level (grouped bar chart)
 * [ ] Failure rates by template (grouped bar chart)
 * [ ] Niche vs standard tasks (side-by-side bar chart)
 * [ ] Schema validation heatmap
-* [ ] Unsupported claims by autonomy level (stacked bar chart)
+* [ ] Overclaiming by autonomy level (stacked bar chart)
 * [ ] All charts saved as PNG with Matplotlib, Seaborn, or Plotly
 
 ### Iteration Logs and Traceability
+
 * [ ] Every threshold or weight change documented with reason, before/after metrics, and delta
 * [ ] At least 3 iteration log entries showing experimentation
 * [ ] Final configuration decisions traceable to specific iteration log entries
 
 ### Testing and Documentation
+
 * [ ] Pipeline runs end-to-end without crashes
-* [ ] Output files saved with timestamps (dossiers, task orders, pairs, labels, summaries)
+* [ ] Output files saved with timestamps (profiles, tasks, pairs, labels, summaries)
 * [ ] Pipeline summary JSON includes total records, validation rate, failure distribution, correction rate, timing
-* [ ] You can explain why any given dossier was labeled with specific failure modes
+* [ ] You can explain why any given profile was labeled with specific failure modes
 
-### Domain Integrity
-* [ ] No standard is cited as defining autonomy levels
-* [ ] The autonomy ladder carries its project-defined disclaimer wherever it appears
-* [ ] `field_readiness_grade` carries no standards citation
-* [ ] Failure mode #5 is framed as an evaluation-validity gap, not as dishonesty
-* [ ] Only verified niche tasks appear in generated data
-
-**Remember**: This isn't about following a step-by-step tutorial. It's about understanding the
-problem, making architectural decisions, and proving your solution works through rigorous
-evaluation.
+**Remember**: This isn't about following a step-by-step tutorial. It's about understanding the problem, making architectural decisions, and proving your solution works through rigorous evaluation. Good luck!
